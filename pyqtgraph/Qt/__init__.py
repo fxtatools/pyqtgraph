@@ -10,7 +10,12 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import warnings
+
+from importlib.util import find_spec
+from types import ModuleType
+import typing as t
 
 PYSIDE = 'PySide'
 PYSIDE2 = 'PySide2'
@@ -20,8 +25,17 @@ PYQT5 = 'PyQt5'
 PYQT6 = 'PyQt6'
 
 QT_LIB = os.getenv('PYQTGRAPH_QT_LIB')
+QTPY_QT_API = os.getenv('QT_API')
+if QT_LIB is None:
+    QT_LIB = QTPY_QT_API
 
 if QT_LIB is not None:
+    # normalize the module name case, using the namespace
+    # of this module to determine the package name for import
+    _qt_lib = sys.modules[__name__].__dict__.get(QT_LIB.upper())
+    if _qt_lib is None:
+        raise RuntimeError("QT_LIB not recognized", QT_LIB)
+    QT_LIB = _qt_lib
     try:
         __import__(QT_LIB)
     except ModuleNotFoundError:
@@ -52,6 +66,32 @@ if QT_LIB is None:
 
 if QT_LIB is None:
     raise Exception("PyQtGraph requires one of PyQt5, PyQt6, PySide2 or PySide6; none of these packages could be imported.")
+
+
+if find_spec("qtpy"):
+    if QTPY_QT_API is None:
+        # set the preferred library for import with qtpy
+        os.environ["QT_API"] = QT_LIB
+        QTPY_QT_API = QT_LIB
+    elif QTPY_QT_API is not None and QT_LIB.lower() != QTPY_QT_API.lower():
+        # warn on mismatch, before qtpy import
+        raise warnings.warn("QT_LIB %r does not match os.environ QT_API %r" % (QT_LIB, QTPY_QT_API,),
+                            stacklevel=2)
+
+    if "FORCE_QT_API" not in os.environ:
+        # ensure the selected package will be used by qtpy
+        os.environ["FORCE_QT_API"] = "1"
+
+    try:
+        import qtpy
+    except Exception:
+        traceback.print_exception(*sys.exc_info())
+        warnings.warn("Unable to import qtpy", stacklevel=2)
+    else:
+        # check parity after qtpy import, warn on mistmatch
+        if QT_LIB.lower() != qtpy.API_NAME.lower():
+            warnings.warn("QT_LIB %r does not match qtpy.API_NAME %r" % (QT_LIB, qtpy.API_NAME,),
+                        stacklevel=2)
 
 
 class FailedImport(object):
@@ -147,17 +187,43 @@ def _copy_attrs(src, dst):
         if not hasattr(dst, o):
             setattr(dst, o, getattr(src, o))
 
+def _mirror_submodules(module: str, dest: str, submodules: list[str]):
+    # for each submodule of module, copy attributes from the
+    # submodule to a similarly named submodule of the dest module
+    spec = find_spec(module)
+    if spec is None:
+        raise ImportError("Module not found", module)
+    elif module in sys.modules:
+        origin = sys.modules[module]
+    else:
+        loader = spec.loader
+        # portable for Python 3.4+
+        origin = loader.create_module(spec) or ModuleType(module)
+        loader.exec_module(origin)
+
+    local = sys.modules[dest]
+    for sub in submodules:
+        fullname = origin.__name__ + "." + sub
+        sub_spec = find_spec(fullname)
+        if sub_spec is None:
+            raise ImportError("Submodule not found", sub, module)
+        else:
+            loader = sub_spec.loader
+            origin_ns = loader.create_module(sub_spec) or ModuleType(fullname)
+            loader.exec_module(origin_ns)
+        local_ns = getattr(local, sub)
+        _copy_attrs(origin_ns, local_ns)
+
+
 from . import QtCore, QtGui, QtWidgets, compat
+
+_qt_submodules = "QtCore", "QtGui", "QtWidgets"
+
+_mirror_submodules(QT_LIB, __name__, _qt_submodules)
 
 if QT_LIB == PYQT5:
     # We're using PyQt5 which has a different structure so we're going to use a shim to
     # recreate the Qt4 structure for Qt5
-    import PyQt5.QtCore
-    import PyQt5.QtGui
-    import PyQt5.QtWidgets
-    _copy_attrs(PyQt5.QtCore, QtCore)
-    _copy_attrs(PyQt5.QtGui, QtGui)
-    _copy_attrs(PyQt5.QtWidgets, QtWidgets)
 
     try:
         from PyQt5 import sip
@@ -178,13 +244,6 @@ if QT_LIB == PYQT5:
     VERSION_INFO = 'PyQt5 ' + QtCore.PYQT_VERSION_STR + ' Qt ' + QtCore.QT_VERSION_STR
 
 elif QT_LIB == PYQT6:
-    import PyQt6.QtCore
-    import PyQt6.QtGui
-    import PyQt6.QtWidgets
-    _copy_attrs(PyQt6.QtCore, QtCore)
-    _copy_attrs(PyQt6.QtGui, QtGui)
-    _copy_attrs(PyQt6.QtWidgets, QtWidgets)
-
     from PyQt6 import sip, uic
 
     try:
@@ -203,13 +262,6 @@ elif QT_LIB == PYQT6:
     VERSION_INFO = 'PyQt6 ' + QtCore.PYQT_VERSION_STR + ' Qt ' + QtCore.QT_VERSION_STR
 
 elif QT_LIB == PYSIDE2:
-    import PySide2.QtCore
-    import PySide2.QtGui
-    import PySide2.QtWidgets
-    _copy_attrs(PySide2.QtCore, QtCore)
-    _copy_attrs(PySide2.QtGui, QtGui)
-    _copy_attrs(PySide2.QtWidgets, QtWidgets)
-    
     try:
         from PySide2 import QtSvg
     except ImportError as err:
@@ -222,14 +274,8 @@ elif QT_LIB == PYSIDE2:
     import PySide2
     import shiboken2 as shiboken
     VERSION_INFO = 'PySide2 ' + PySide2.__version__ + ' Qt ' + QtCore.__version__
-elif QT_LIB == PYSIDE6:
-    import PySide6.QtCore
-    import PySide6.QtGui
-    import PySide6.QtWidgets
-    _copy_attrs(PySide6.QtCore, QtCore)
-    _copy_attrs(PySide6.QtGui, QtGui)
-    _copy_attrs(PySide6.QtWidgets, QtWidgets)
 
+elif QT_LIB == PYSIDE6:
     try:
         from PySide6 import QtSvg
     except ImportError as err:
@@ -249,7 +295,6 @@ elif QT_LIB == PYSIDE6:
 
 else:
     raise ValueError("Invalid Qt lib '%s'" % QT_LIB)
-
 
 
 if QT_LIB in [PYQT6, PYSIDE6]:
